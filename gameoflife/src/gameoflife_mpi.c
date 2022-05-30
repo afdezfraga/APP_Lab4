@@ -191,9 +191,9 @@ int main(int argc, char **argv)
   c1_time = MPI_Wtime();
 
   /* draw the final space state in a bmp image */
-  write_bmp_mpi(output_filename, &s, gsize, mpi.dim, mpi.comm);
-  if (!mpi.rank)
-    printf("\nFinal state dumped to %s\n", output_filename);
+  //write_bmp_mpi(output_filename, &s, gsize, mpi.dim, mpi.comm);
+  //if (!mpi.rank)
+    //printf("\nFinal state dumped to %s\n", output_filename);
 
   /* dump the final space state */
   print_state(&s, "output", gsize, &mpi);

@@ -6,7 +6,7 @@ LFLAGS = -lm
 
 GOL_COMMON = src/gol_common.c
 
-BINFILES=bin/gameoflife_seq bin/gameoflife_mpi bin/gameoflife_mpi_rdma
+BINFILES=bin/gameoflife_seq bin/gameoflife_mpi bin/gameoflife_mpi_rdma bin/gameoflife_mpi_subarray bin/gameoflife_mpi_fullView bin/gameoflife_mpi_narrowView
 
 all: $(BINFILES)
 

@@ -46,9 +46,6 @@ typedef struct {
   int dim[2];      /* mpi proc grid dimensions */
   int coord[2];    /* mpi proc grid coordinate */
   MPI_Comm comm;   /* mpi intercommunicator */
-  MPI_Group x_procs;
-  MPI_Group all_procs;
-  MPI_Win space_window;
 } parallel_state;
 
 void game(state * s, int max_gens, parallel_state * mpi);
@@ -57,12 +54,11 @@ int read_input(state * s, const char * filename, const int *gsize, parallel_stat
 void print_state(state * s, const char * filename, int *gsizes, parallel_state * mpi);
 
 MPI_Datatype mpi_lcontig_t, mpi_lrow_t, mpi_lcol_t,
-             mpi_scontig_t,  mpi_sblock_t;
+             mpi_scontig_t,  mpi_sblock_t, mpi_file_block_t;
 
 int main(int argc, char **argv)
 {
   MPI_Init(&argc, &argv);
-  MPI_Win checksum_window;
 
   state s;
 
@@ -126,16 +122,6 @@ int main(int argc, char **argv)
   lsize[COLS] = gsize[COLS]/mpi.dim[COLS];
 
   alloc_state(&s, lsize[ROWS], lsize[COLS], WITH_HALO);
-  int elements_in_space = s.halo ? (s.cols+2) * (s.rows+2) : s.cols * s.rows;
-  MPI_Win_create( s.space[0] , elements_in_space * sizeof(char) , sizeof(char) , MPI_INFO_NULL , mpi.comm , &(mpi.space_window));
-  MPI_Win_create( &(s.checksum) , sizeof(long) , sizeof(long) , MPI_INFO_NULL , mpi.comm , &checksum_window);
-
-  /* crete groups for pscw RDMA */
-  MPI_Group cart_group;
-  MPI_Comm_group( mpi.comm , &cart_group);
-  mpi.all_procs = cart_group;
-  //MPI_Group_incl( cart_group , 4 , &(mpi.neighbor[UP]) , &(mpi.all_procs));
-  //MPI_Group_incl( cart_group , 2 , &(mpi.neighbor[LEFT]) , &(mpi.x_procs));
 
   /* create extended block datatypes */
   MPI_Type_contiguous(s.cols, MPI_CHAR, &mpi_lcontig_t);
@@ -154,6 +140,11 @@ int main(int argc, char **argv)
                           sizeof(char),   /* new extent */
                           &mpi_sblock_t); /* new datatype (output) */
   MPI_Type_commit(&mpi_sblock_t);
+  // MPI-IO create subarray datatype
+  int subsizes[2] = {s.rows, s.cols};
+  int starts[2] = {mpi.coord[ROWS] * s.rows, mpi.coord[COLS] * s.cols};
+  MPI_Type_create_subarray( 2 , gsize , subsizes , starts , MPI_ORDER_C, MPI_CHAR , &mpi_file_block_t);
+  MPI_Type_commit(&mpi_file_block_t);
 
   /* print grid configuration */
   for (int p=0; p<mpi.size; ++p)
@@ -195,32 +186,19 @@ int main(int argc, char **argv)
   }
 
   //TODO: Replace the Reduction with an Accumulate operation
-  /*MPI_Reduce(mpi.rank?&s.checksum:MPI_IN_PLACE, &s.checksum, 1,
+  MPI_Reduce(mpi.rank?&s.checksum:MPI_IN_PLACE, &s.checksum, 1,
                MPI_LONG, MPI_SUM, 0,
-               MPI_COMM_WORLD);*/
-
-  MPI_Win_post( cart_group , 0, checksum_window);
-  MPI_Win_start( cart_group , 0, checksum_window);
-
-  if(mpi.rank){
-    MPI_Accumulate(&s.checksum, 1, MPI_LONG, 0, 0, 1, MPI_LONG, MPI_SUM, checksum_window);
-  }
-
-  MPI_Win_complete(checksum_window);
-  MPI_Win_wait(checksum_window);
+               MPI_COMM_WORLD);
 
   if (!mpi.rank)
     printf("\nGlobal Checksum after %ld generations: %ld\n", s.generation, s.checksum);
 
   c1_time = MPI_Wtime();
 
-  MPI_Win_free( &(mpi.space_window));
-  MPI_Win_free( &checksum_window);
-
   /* draw the final space state in a bmp image */
-  write_bmp_mpi(output_filename, &s, gsize, mpi.dim, mpi.comm);
-  if (!mpi.rank)
-    printf("\nFinal state dumped to %s\n", output_filename);
+  //write_bmp_mpi(output_filename, &s, gsize, mpi.dim, mpi.comm);
+  //if (!mpi.rank)
+    //printf("\nFinal state dumped to %s\n", output_filename);
 
   /* dump the final space state */
   print_state(&s, "output", gsize, &mpi);
@@ -235,6 +213,7 @@ int main(int argc, char **argv)
     printf("  Output: %lf seconds\n", e_time - c1_time);
   }
   free_state(&s);
+  MPI_Type_free(&mpi_file_block_t);
 
   MPI_Finalize();
 }
@@ -260,33 +239,37 @@ void game(state * s, int max_gens, parallel_state * mpi)
  */
 void swap_halo(state * s, parallel_state * mpi)
 {
+  //TODO: Replace this function body with MPI RMA
   
-  // Comunicate in x-y-direction
-  MPI_Win_post( mpi->all_procs , 0, mpi->space_window);
-  MPI_Win_start( mpi->all_procs , 0, mpi->space_window);
+  MPI_Request req0, req1;
   
-  MPI_Put(s->space[1]+1, 1, mpi_lcol_t, mpi->neighbor[LEFT], (s->cols+2)*(1) + s->cols+1, 1, mpi_lcol_t, mpi->space_window);
-  MPI_Put(s->space[1]+s->cols, 1, mpi_lcol_t, mpi->neighbor[RIGHT], (s->cols+2)*(1), 1, mpi_lcol_t, mpi->space_window);
-  MPI_Put(s->space[s->rows]+1, 1, mpi_lrow_t, mpi->neighbor[DOWN], 1, 1, mpi_lrow_t, mpi->space_window);
-  MPI_Put(s->space[1]+1, 1, mpi_lrow_t, mpi->neighbor[UP], (s->cols+2)*(s->rows+1)+1, 1, mpi_lrow_t, mpi->space_window);
-  
-  MPI_Win_complete(mpi->space_window);
-  MPI_Win_wait(mpi->space_window);
+  /* Communicate in y-direction */
 
+  MPI_Isend(s->space[s->rows]+1, s->cols, MPI_CHAR, mpi->neighbor[DOWN], UP, mpi->comm, &req0);
+  MPI_Recv(s->space[0]+1, s->cols, MPI_CHAR, mpi->neighbor[UP], UP, mpi->comm, MPI_STATUS_IGNORE);
+  MPI_Isend(s->space[1]+1, s->cols, MPI_CHAR, mpi->neighbor[UP], DOWN, mpi->comm, &req0);
+  MPI_Recv(s->space[s->rows+1]+1, s->cols, MPI_CHAR, mpi->neighbor[DOWN], DOWN, mpi->comm, MPI_STATUS_IGNORE);
 
-  // Communicate corners in x-direction
+  /* Communicate in x-direction */
 
-  MPI_Win_post( mpi->all_procs , 0, mpi->space_window);
-  MPI_Win_start( mpi->all_procs , 0, mpi->space_window);
-  
-  MPI_Put(s->space[0]+1, 1, MPI_CHAR, mpi->neighbor[LEFT], s->cols+1, 1, MPI_CHAR, mpi->space_window);
-  MPI_Put(s->space[0]+s->cols, 1, MPI_CHAR, mpi->neighbor[RIGHT], 0, 1, MPI_CHAR, mpi->space_window);
-  MPI_Put(s->space[s->rows+1]+1, 1, MPI_CHAR, mpi->neighbor[LEFT], (s->cols+2)*(s->rows+2)-1, 1, MPI_CHAR, mpi->space_window);
-  MPI_Put(s->space[s->rows+1]+s->cols, 1, MPI_CHAR, mpi->neighbor[RIGHT], (s->cols+2)*(s->rows+1)+0, 1, MPI_CHAR, mpi->space_window);
+  MPI_Isend(s->space[1]+s->cols, 1, mpi_lcol_t, mpi->neighbor[RIGHT], RIGHT, mpi->comm, &req0);
+  MPI_Recv(s->space[1],           1, mpi_lcol_t, mpi->neighbor[LEFT], RIGHT, mpi->comm, MPI_STATUS_IGNORE);
+  MPI_Isend(s->space[1]+1,         1, mpi_lcol_t, mpi->neighbor[LEFT], LEFT, mpi->comm, &req1);
+  MPI_Recv(s->space[1]+s->cols+1, 1, mpi_lcol_t, mpi->neighbor[RIGHT], LEFT, mpi->comm, MPI_STATUS_IGNORE);
 
-  MPI_Win_complete(mpi->space_window);
-  MPI_Win_wait(mpi->space_window); 
-  
+  /* Swap corner data in auxiliary rows*/
+  char scornerbuf[4] = {s->space[0][s->cols], s->space[s->rows+1][s->cols], s->space[0][1], s->space[s->rows+1][1]};
+  char rcornerbuf[4];
+
+  MPI_Isend(scornerbuf, 2, MPI_CHAR, mpi->neighbor[RIGHT], RIGHT, mpi->comm, &req0);
+  MPI_Recv(rcornerbuf, 2, MPI_CHAR, mpi->neighbor[LEFT], RIGHT, mpi->comm, MPI_STATUS_IGNORE);
+  MPI_Isend(scornerbuf+2, 2, MPI_CHAR, mpi->neighbor[LEFT], LEFT, mpi->comm, &req0);
+  MPI_Recv(rcornerbuf+2, 2, MPI_CHAR, mpi->neighbor[RIGHT], LEFT, mpi->comm, MPI_STATUS_IGNORE);
+
+  s->space[0][0] = rcornerbuf[0];
+  s->space[s->rows+1][0] = rcornerbuf[1];
+  s->space[0][s->cols+1] = rcornerbuf[2];
+  s->space[s->rows+1][s->cols+1] = rcornerbuf[3];
 }
 
 /*
@@ -297,99 +280,40 @@ void swap_halo(state * s, parallel_state * mpi)
 int read_input(state * s, const char * filename, const int *gsize, parallel_state * mpi)
 {
   //TODO: Replace this function body with RMA I/O
-  
-  char *mat = 0;
-  int disps[mpi->size];
-  int counts[mpi->size];
   int return_val;
+  MPI_File in_file;
 
-  if (!mpi->rank)
-  {
-    /* read initial state from file */
-    mat = (char *) malloc(gsize[ROWS] * gsize[COLS] * sizeof(char));
 
-    FILE * ifile = fopen(filename, "r");
-    if (!ifile)
-    {
-      fprintf(stderr, "Error: %s %s\n", strerror(errno), filename);
-      fflush(stderr);
-      return errno;
-    }
+  assert(s->halo);
 
-    for (int y=0; y<gsize[ROWS]; ++y)
-    {
-      int readcnt = fread(mat + y * gsize[COLS], sizeof(char), gsize[COLS], ifile);
-      if (readcnt != gsize[COLS]) {
-          fprintf(stderr,
-                  "ERROR, syntax error in '%s'. fread returned %d instead of %d\n",
-                  filename, readcnt, gsize[COLS]);
-          fprintf(stderr,
-                  "       check if size (%d, %d) is correct for '%s'\n",
-                  s->rows, s->cols, filename);
-          fflush(stderr);
-          return errno;
-      }
-    }
-    fclose(ifile);
-  }
 
-  /* scatter matrix among all processes */
-  for (int y=0; y<mpi->dim[ROWS]; y++) {
-      for (int x=0; x<mpi->dim[COLS]; x++) {
-          disps[y*mpi->dim[COLS]+x] = y*gsize[COLS]*s->rows+x*s->cols;
-          counts [y*mpi->dim[COLS]+x] = 1;
-      }
-  }
+  return_val = MPI_File_open(mpi->comm, filename, MPI_MODE_RDONLY, MPI_INFO_NULL, &in_file);
 
-  return_val = MPI_Scatterv(mat, counts, disps, mpi_sblock_t,
-                            &s->space[1][1], s->rows, mpi_lrow_t,
-                            0, mpi->comm);
+  return_val |= MPI_File_set_view( in_file, 0, MPI_CHAR, mpi_file_block_t, "native", MPI_INFO_NULL);
 
-  if (mat) free(mat);
+  return_val |= MPI_File_read_all( in_file, &(s->space[1][1]), s->rows, mpi_lrow_t, MPI_STATUS_IGNORE);
 
-  if (return_val != MPI_SUCCESS)
-  {
-    char err_string[MPI_MAX_ERROR_STRING];
-    int len;
-    MPI_Error_string(return_val, err_string, &len);
-    fprintf(stderr,"Error %d: %s\n", return_val, err_string);
-    fflush(stderr);
-  }
+  return_val |= MPI_File_close(&in_file);
+
   return return_val;
 }
 
 void print_state(state * s, const char * filename, int *gsize, parallel_state * mpi)
 {
-  // TODO: Replace this function body with MPI I/O
   
-  // This function should write in parallel the space of state "s" to a file
-  // The output file must be also a valid input file
-  // If GoL is run with '0' iterations, the output file should be equal to input file
-  
-  char *mat = 0;
-  int disps[mpi->size];
-  int counts[mpi->size];
   int return_val;
+  MPI_File out_file;
 
   assert(s->halo);
+
+  return_val = MPI_File_open(mpi->comm, filename, MPI_MODE_CREATE | MPI_MODE_WRONLY, MPI_INFO_NULL, &out_file);
+
+  return_val |= MPI_File_set_view( out_file, 0, MPI_CHAR, mpi_file_block_t, "native", MPI_INFO_NULL);
+
+  return_val |= MPI_File_write_all( out_file, &(s->space[1][1]), s->rows, mpi_lrow_t, MPI_STATUS_IGNORE);
+
+  return_val |= MPI_File_close(&out_file);
   
-  if (!mpi->rank)
-  {
-    /* read initial state from file */
-    mat = (char *) malloc(gsize[ROWS] * gsize[COLS] * sizeof(char));
-  }
-
-  /* gather matrix from all processes */
-  for (int y=0; y<mpi->dim[ROWS]; y++) {
-      for (int x=0; x<mpi->dim[COLS]; x++) {
-          disps[y*mpi->dim[COLS]+x] = y*gsize[COLS]*s->rows+x*s->cols;
-          counts [y*mpi->dim[COLS]+x] = 1;
-      }
-  }
-
-  return_val = MPI_Gatherv(&s->space[1][1], s->rows, mpi_lrow_t,
-                           mat, counts, disps, mpi_sblock_t,
-                           0, mpi->comm);
 
   if (return_val != MPI_SUCCESS)
   {
@@ -401,14 +325,5 @@ void print_state(state * s, const char * filename, int *gsize, parallel_state * 
     MPI_Finalize();
     exit(1);
   }
-  
-  if (mpi->rank == 0)
-  {
-    FILE * ofile = fopen(filename, "w");
-  
-    fwrite(mat, sizeof(char), gsize[ROWS]*gsize[COLS], ofile);
-
-    fclose(ofile);
-    free(mat);
-  }  
+   
 }
